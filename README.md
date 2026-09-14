@@ -20,8 +20,9 @@ docker compose up --build
 | <http://localhost:3737/keystatic> | CMS admin UI (dev server only) |
 
 First start builds the image and installs deps into a named Docker volume
-(`docs_node_modules`) — the repo tree on the host stays clean. Subsequent
-starts are fast.
+(`docs_node_modules`) — the repo tree on the host stays clean. Deps are
+installed with **bun** (~7s cold for 453 packages, vs ~50s with npm); node
+stays the runtime. `bun.lock` is the lockfile. Subsequent starts are fast.
 
 Stop: `Ctrl-C` (foreground) or `docker compose down`. The volume survives;
 reset deps with `docker compose down -v`.
@@ -119,8 +120,8 @@ to set `site` + `base` in `astro.config.mjs` to the deploy URL first.
 │   ├── content.config.ts   # Astro content collection (Starlight loader)
 │   ├── content/docs/       # THE DOCS (all versioned content lives here)
 │   └── custom.css          # indigo palette + Space Grotesk
-├── Dockerfile              # node:24-alpine + su-exec (uid 1000 file perms)
-├── docker-entrypoint.sh    # npm install → drop to node user → astro dev
+├── Dockerfile              # node:24-alpine + bun + su-exec (uid 1000 file perms)
+├── docker-entrypoint.sh    # bun install → drop to node user → astro dev
 └── docker-compose.yml      # port 3737, bind mount, deps volume
 ```
 

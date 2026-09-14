@@ -1,5 +1,9 @@
 FROM node:24-alpine
 
+# bun for fast dependency installs (node stays the runtime — astro's CLI
+# and vite tooling are happiest under node; bun just resolves + links fast)
+COPY --from=oven/bun:1-alpine /usr/local/bin/bun /usr/local/bin/bun
+
 # su-exec drops from root to the image's `node` user (uid 1000 = host user)
 # after dependency install, so files Keystatic writes are host-user-owned.
 RUN apk add --no-cache su-exec git

@@ -6,7 +6,7 @@ set -e
 # Install as root (first-run volume is root-owned), then hand the tree to
 # the `node` user (uid 1000 = host user) so vite's cache dirs and the
 # files Keystatic writes are host-user-owned.
-npm install --no-audit --no-fund
+bun install --frozen-lockfile
 chown -R node:node /app/node_modules
 
 # A container restart leaves Astro's dev-server lock behind in the bind
