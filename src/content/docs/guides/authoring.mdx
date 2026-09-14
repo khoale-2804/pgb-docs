@@ -1,0 +1,57 @@
+---
+title: Authoring docs
+description: How to write, save, and version a page in this repo — Keystatic UI or plain files.
+sidebar:
+  order: 2
+---
+
+There are two ways to edit these docs. Both write plain
+Markdown/MDX files into `src/content/docs/` — the file **is** the page.
+
+## Way 1 — browser (Keystatic)
+
+1. Open [http://localhost:3737/keystatic](http://localhost:3737/keystatic)
+   (dev server only — it does not exist in the static build).
+2. Pick **Docs** (top-level pages) or **Guides**.
+3. Edit and hit **Save**. Keystatic writes the file to disk immediately and
+   the site hot-reloads.
+
+**Saving is not versioning.** Keystatic local mode never touches git —
+it only writes files. To persist a change:
+
+```bash
+cd ~/data/pgb-docs
+git add -A && git commit -m "docs: ..."
+```
+
+## Way 2 — editor
+
+Open any file under `src/content/docs/`, edit, save. Same hot reload.
+
+## Frontmatter contract
+
+```yaml
+---
+title: My page        # required; becomes the slug of NEW pages
+description: One line # shows under the title + in search/meta
+sidebar:
+  order: 2            # optional; position inside the Guides sidebar
+---
+```
+
+:::caution
+Keystatic strips frontmatter keys it does not know when saving through the
+UI. `title` and `description` are safe; hand-edit pages that use Starlight
+extras (`template`, `hero`, `sidebar`, `prev`/`next`) — the landing
+`index.mdx` is such a page.
+:::
+
+## Where things go
+
+| File | Role |
+| --- | --- |
+| `src/content/docs/index.mdx` | Landing page (splash hero) — hand-edit only |
+| `src/content/docs/guides/*.mdx` | Guides — auto-listed in the sidebar |
+| `src/content/docs/<dir>/*.mdx` | New section = new dir + a sidebar entry in `astro.config.mjs` |
+| `astro.config.mjs` | Site title, sidebar sections, theme |
+| `src/custom.css` | Indigo palette + Space Grotesk |

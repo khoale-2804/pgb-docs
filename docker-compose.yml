@@ -1,0 +1,13 @@
+services:
+  docs:
+    build: .
+    container_name: pgb-docs
+    ports:
+      - "3737:4321" # site http://localhost:3737 · CMS http://localhost:3737/keystatic
+    volumes:
+      - .:/app
+      - docs_node_modules:/app/node_modules
+    restart: unless-stopped
+
+volumes:
+  docs_node_modules:

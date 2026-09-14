@@ -1,0 +1,59 @@
+---
+title: pgb
+description: Two-stage Postgres codegen with full ParadeDB support — typed builders and static query functions generated from your schema.
+template: splash
+hero:
+  tagline: postgres in · typed go out
+  title: Your schema is the API.
+  actions:
+    - text: Run the quickstart
+      link: /guides/quickstart
+      icon: right-arrow
+    - text: Author a doc
+      link: /guides/authoring
+      variant: minimal
+---
+
+The whole flow, end to end — no SQL strings in application code:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/khoale-2804/pgb/core"
+    "github.com/jackc/pgx/v5/pgxpool"
+    db "github.com/khoale-2804/shop/db"
+)
+
+func main() {
+    ctx := context.Background()
+    pool, err := pgxpool.New(ctx, "postgres://localhost/shop")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // static layer: insert, read, update — no hand-written SQL
+    u, err := db.InsertUser(ctx, pool, db.InsertUserParams{
+        Email: "ada@example.com",
+        Name:  "Ada",
+    })
+
+    // search layer: BM25 with fuzzy matching, scored, snippeted
+    hits, err := db.SearchProducts(ctx, pool, "runing shoes", db.SearchOpts{
+        Fuzzy:   1,
+        Snippet: "description",
+    })
+    for _, h := range hits {
+        log.Printf("%.2f  %s", h.Score, h.Row.Title)
+    }
+}
+```
+
+Two editions, one compiler: the **sqlc plugin edition** (v0.1) drops into
+your existing sqlc workflow; the **standalone ORM edition** (v0.2+) brings
+the full toolkit on the Go module proxy.
+
+PostgreSQL 18 · 19 gated · pg_search 0.25.9+ / 0.26-rc · pgx/v5 · Go 1.24+ · MIT

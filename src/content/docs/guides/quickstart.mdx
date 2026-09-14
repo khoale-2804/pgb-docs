@@ -1,0 +1,53 @@
+---
+title: Quickstart
+description: Wire pgb into sqlc and generate your first builder + static functions.
+sidebar:
+  order: 1
+---
+
+pgb is a sqlc **process plugin**: a Go binary sqlc invokes with a protobuf
+`GenerateRequest` on stdin. You need [sqlc](https://docs.sqlc.dev), Go 1.24+,
+and pgx/v5 in your project.
+
+## 1. Build the plugin binary
+
+```bash
+git clone https://github.com/khoale-2804/pgb && cd pgb
+go build -o /usr/local/bin/sqlc-gen-pgb ./gen
+```
+
+## 2. Point sqlc.yaml at it
+
+```yaml
+version: '2'
+plugins:
+  - name: pgb
+    process:
+      cmd: sqlc-gen-pgb
+sql:
+  - engine: postgresql
+    queries: queries/
+    schema: schema.sql
+    gen:
+      go:
+        package: db
+        out: db
+        plugins:
+          - name: pgb
+```
+
+:::note
+The PostgreSQL 18 parser (`sqlc-dev/oliphant`) lives on sqlc **main** —
+install with `go install github.com/sqlc-dev/sqlc/cmd/sqlc@main` until it
+lands in a tagged release.
+:::
+
+## 3. Generate
+
+```bash
+sqlc generate
+```
+
+`db/` now contains typed models, fluent builders, and static query
+functions — plus `pg_search` predicates for every `USING paradedb` index
+in your schema.

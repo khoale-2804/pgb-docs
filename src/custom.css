@@ -1,0 +1,24 @@
+/* pgb docs — ParadeDB indigo + Space Grotesk display voice.
+   Everything else stays quiet — polish, not decoration. */
+
+:root {
+  --sl-color-accent-low: #c7d2fe;
+  --sl-color-accent: #4f46e5;
+  --sl-color-accent-high: #4338ca;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #1e1b4b;
+  --sl-color-accent: #818cf8;
+  --sl-color-accent-high: #a5b4fc;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: 'Space Grotesk', var(--sl-font, sans-serif);
+  letter-spacing: -0.02em;
+}
