@@ -1,0 +1,135 @@
+---
+sidebar:
+  order: 13
+title: "Handwritten queries"
+description: "Coexisting with sqlc .sql files — when to keep them, how pg_search calls type-check, database-backed analysis."
+---
+
+pgb does not abolish handwritten SQL — it shrinks it to the queries that genuinely deserve it: CTE chains, window tricks, PGQ, reporting. Everything repetitive moves to the generated layer.
+
+## How handwritten queries work under pgb
+
+`queries.sql` entries are resolved by sqlc (parsed, analyzed, params and result columns computed) and arrive in the plugin request. pgb emits typed wrappers into `db/` in the sqlc-gen-go style, honoring the standard annotations: `:one`, `:many`, `:exec`, `:execrows`, `:batchexec`, `:copyfrom`, ...
+
+```sql
+-- name: RevenueByMonth :many
+SELECT date_trunc('month', created_at) AS month, sum(amount) AS revenue
+FROM orders
+WHERE shop_id = $1
+GROUP BY 1 ORDER BY 1;
+```
+
+becomes a typed `db.RevenueByMonth(ctx, pool, shopID)` — same ergonomics you have today.
+
+## Annotation quick reference
+
+The standard sqlc annotations, and what pgb's generated wrapper looks like for each. All wrappers take `exec pgb.DBTX` — pass `pool` at call sites, `tx` inside transactions:
+
+| annotation | wrapper returns | SQL shape | notes |
+|---|---|---|---|
+| `:one` | `(T, error)` | plain query | first row scanned; zero rows → `pgx.ErrNoRows` (sqlc semantics preserved) |
+| `:many` | `([]T, error)` | plain query | full result set, sliced |
+| `:exec` | `error` | statement, no scan | INSERT/UPDATE/DELETE without results |
+| `:execrows` | `(int64, error)` | statement | rows affected |
+| `:batchexec` | `error` | queued statements via `pgx.Batch` | one round trip for N statements |
+| `:copyfrom` | `(int64, error)` | `COPY ... FROM STDIN` | single table, no RETURNING — fastest ingest; for bulk loads prefer the generated `CopyFromXxx` |
+
+## A :many + :one pair
+
+```sql
+-- name: ListOpenOrders :many
+SELECT id, user_id, status, total
+FROM orders
+WHERE tenant_id = $1 AND status <> 'shipped'
+ORDER BY placed_at DESC
+LIMIT $2;
+
+-- name: OpenOrderCount :one
+SELECT count(*) AS n
+FROM orders
+WHERE tenant_id = $1 AND status <> 'shipped';
+```
+
+Because each query selects a column subset (not the full `db.Order` shape), pgb emits a Row struct per query, sqlc-gen-go style, with explicit positional scans on the shared type map:
+
+```go
+// generated in db/orders.sql.gen.go
+type ListOpenOrdersRow struct {
+	ID     int64
+	UserID int64
+	Status string
+	Total  pgtype.Numeric
+}
+
+type OpenOrderCountRow struct {
+	N int64
+}
+
+func ListOpenOrders(
+	ctx context.Context, exec pgb.DBTX, tenantID int64, limit int32,
+) ([]ListOpenOrdersRow, error)
+
+func OpenOrderCount(
+	ctx context.Context, exec pgb.DBTX, tenantID int64,
+) (OpenOrderCountRow, error)
+```
+
+Call sites look exactly like the static layer — executor first-class, typed results out:
+
+```go
+open, err := db.ListOpenOrders(ctx, pool, tenantID, 50)
+if err != nil {
+	return err
+}
+n, err := db.OpenOrderCount(ctx, pool, tenantID)
+```
+
+A query whose selected columns exactly match its table's model returns `db.Order` values instead of a Row struct — the Row struct exists only when the projection differs.
+
+## pg_search in handwritten queries
+
+The analyzer does not know ParadeDB's functions:
+
+- **sqlc v1.31.1** — `pdb.score(id)` fails analysis ("function does not exist").
+- **sqlc main** — unknown functions/operators degrade gracefully: the expression goes untyped and the generated column becomes `any` (main-branch behavior, unreleased as of v1.31.1).
+
+Two clean fixes:
+
+**1. Cast in SQL** — cheapest, always available:
+
+```sql
+-- name: SearchProducts :many
+SELECT id, name, pdb.score(id)::float8 AS score
+FROM products
+WHERE description ||| $1
+ORDER BY pdb.score(id) DESC, id
+LIMIT $2;
+```
+
+**2. Database-backed analysis** — point sqlc at a live ParadeDB so extension types resolve from the real catalog:
+
+```yaml
+sql:
+  - engine: postgresql
+    database:
+      uri: ${PARADEDB_URI}
+      analyzer: { database: true }
+```
+
+## Choosing the lane
+
+Four lanes, one type map. Decide per statement, not per project:
+
+| need | reach for | why |
+|---|---|---|
+| CRUD by key, known filters, count, upsert, batch, copy | **generated static functions** | zero SQL written, typed params, `ErrNotFound` handling, batch/COPY built in |
+| filters assembled at runtime from optional inputs | **generated builders** | predicates compose structurally — always sargable, no `(@x IS NULL OR col = @x)` |
+| CTE chains, window functions, PGQ, reporting one-offs | **handwritten `queries.sql`** | sqlc analyzes them, pgb emits typed wrappers with your annotations |
+| one expression the builder or filter can't say (`id IN (subquery)`, ltree `<@`) | **`core.Raw(...)` inside `Where` / `Extra`** | composes with generated predicates; args stay bound, renumbered automatically |
+| statement sqlc's analyzer cannot parse (`RETURNING OLD/NEW`, `ON CONFLICT DO SELECT`) | **generated layer** (statics or builders) | pgb's emitter knows PG18/19 syntax the analyzer does not — see [version gates](reference/version-gates) |
+
+The lanes compose: a `core.Expr` from a descriptor feeds `UserFilter.Extra`, a handwritten CTE can wrap a builder statement, and `Raw` bridges any remaining gap — all four produce SQL through the same [core emitter](reference/core-api).
+
+## vet keeps working
+
+`sqlc vet` runs over the whole project — including rules against your handwritten queries. The generated layer is linted by Go's own toolchain plus pgb's golden tests.

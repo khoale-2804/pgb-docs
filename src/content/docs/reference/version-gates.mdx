@@ -1,0 +1,108 @@
+---
+sidebar:
+  order: 5
+title: "Postgres version gates"
+description: "What pgb emits per Postgres version — 18 features today, 19 features behind a gate until GA."
+---
+
+`target: "18" | "19"` in the pgb options controls the SQL emitter's feature gates. The generated code stays version-agnostic — the gate only controls which syntax the emitter is allowed to produce.
+
+| feature | introduced | pgb behavior |
+|---|---|---|
+| explicit column lists in RETURNING | all versions | always used — `SELECT *` is never emitted |
+| default-bearing columns omitted from INSERT | all versions | unless `IncludeDefaults` |
+| `MERGE ... RETURNING` | 17 | `MERGE` builder behind `emit.merge` (M4/M5, off by default) |
+| virtual generated columns (new default kind) | 18 | excluded from INSERT/UPDATE/UPSERT column lists; fine in filters and RETURNING |
+| `uuidv7()` | 18 | nothing emitted (defaults live in your schema); DDL lint suggests uuidv7 for new uuid PKs |
+| `RETURNING OLD/NEW` | 18 | emitter supports it; note sqlc's analyzer still cannot parse it in handwritten queries (#4355) — another reason such statements belong in the generated layer |
+| temporal constraints (`WITHOUT OVERLAPS`) | 18 | detected in the IR; temporal upserts get an explicit "use Raw" error in v1, emitter support in M5 |
+| `INSERT ... ON CONFLICT DO SELECT RETURNING` | 19 | `UpsertOpts.OnSelect` gated behind `target: "19"`; syntax re-verified at PG19 GA (currently beta) |
+| `FOR PORTION OF` (update/delete) | 19 | planned M5 |
+| SQL/PGQ property graphs | 19 | non-goal — `Raw()` escape hatch |
+| `WAIT FOR` | 19 | out of scope |
+
+## Two gates in emitted SQL
+
+### Generated columns excluded from writes (PG18, default gate)
+
+PG18 makes *virtual* the default generated-column kind. Postgres rejects any write to a generated column, so the emitter drops it from every INSERT column list, every VALUES row, every UPDATE `SET`, and every upsert `DO UPDATE` — while keeping it in filters, RETURNING lists, and scans:
+
+```sql
+CREATE TABLE invoices (
+    id         bigserial PRIMARY KEY,
+    cents      int8        NOT NULL,
+    total      numeric GENERATED ALWAYS AS
+        (cents::numeric / 100) VIRTUAL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+```sql
+INSERT INTO public.invoices (cents)
+VALUES ($1)
+RETURNING id, cents, total, created_at
+```
+
+`total` is absent from the column list but present in RETURNING — the round trip hands the computed value straight back. The same exclusion in an UPDATE:
+
+```sql
+UPDATE public.invoices
+SET cents = $1
+WHERE id = $2
+RETURNING id, cents, total, created_at
+```
+
+Unlike default-bearing columns (`include_defaults: true` can put them back), there is no opt-out for generated columns — writing to them is a server error in every Postgres version that has them.
+
+### `ON CONFLICT DO SELECT` (PG19 gate)
+
+`UpsertOpts.OnSelect` emits `INSERT ... ON CONFLICT ... DO SELECT RETURNING`, which returns the conflicting row instead of updating it. The gate requires `target: "19"`:
+
+```yaml
+options:
+  target: "19"
+```
+
+```go
+u, err := db.UpsertUser(ctx, pool, db.InsertUserParams{
+	Email: "ada@corp.io",
+	Name:  "Ada Lovelace",
+}, db.UpsertOpts{Target: []string{"email"}, OnSelect: true})
+```
+
+```sql
+INSERT INTO public.users (email, name)
+VALUES ($1, $2)
+ON CONFLICT (email) DO SELECT
+RETURNING id, email, name, bio, metadata, tags, created_at,
+    last_login_at
+```
+
+:::warning
+PG19 is beta (beta 3: 2026-08-13, GA expected late Sept/Oct 2026), and no codegen parser embeds PG19 grammar yet — this syntax was validated against the beta server, not by the parser. pgb re-verifies the emitted `DO SELECT` form at PG19 GA before lifting the beta caveat; if upstream changed the syntax, the fix is a regenerated build away because the gate is in the emitter, not in your call sites. Search emission stays on 15–18 regardless, until ParadeDB ships PG19 binaries.
+:::
+
+## Parser reality
+
+The generator parses your schema with libpg_query 18 (`sqlc-dev/oliphant`; libpg_query 18.0.0 landed 2026-05-21). **No parser embeds PG19 grammar yet** — libpg_query has no 19 branch, and PG19 is beta (beta 3: 2026-08-13, GA expected ~Sept/Oct 2026).
+
+Practical consequence: keep PG19-only DDL (e.g. `CREATE PROPERTY GRAPH`) out of `schema.sql` for now. Emitted DML is validated by the live server, not by the codegen parser, so targeting `19` in the emitter is unaffected.
+
+## ParadeDB access method
+
+The pg_search access method was renamed in 0.25: releases through 0.24 create search indexes with `USING bm25`, 0.25 and later with `USING paradedb`. pgb emits the 0.25+ spelling in every search index it lifts from your schema (see [index DDL extraction](paradedb/index-ddl)), so search features require pg_search ≥ 0.25 — **0.25.9 is the tested floor**, the version the integration lane runs against. On a 0.24 server, applying the generated `CREATE INDEX ... USING paradedb` fails because that access method does not exist there; the fix is upgrading the ParadeDB image or extension, not editing the DDL.
+
+pgb still parses both spellings in your schema — `USING bm25` is accepted as the legacy alias at DDL-extraction time and re-emitted as `USING paradedb`.
+
+## ParadeDB on PG19
+
+pg_search ships binaries for Postgres 15, 16, 17, and 18 — **no 19 builds yet**. The test matrix therefore runs:
+
+- **PG18 + ParadeDB image (`paradedb/paradedb:0.25.9`)** — full matrix including search and hybrid.
+- **postgres:19-beta** — non-search matrix only; `pgb` emits version-agnostic SQL for those paths, so nothing else changes.
+
+When ParadeDB ships PG19 builds, the search lanes join the 19 matrix with zero code changes.
+
+## Support window
+
+The PG19 beta status above tracks the upstream calendar: beta 3 landed 2026-08-13 with GA expected late Sept/Oct 2026, and the supported majors 15–18 are EOL'd 2027-11-11, 2028-11-09, 2029-11-08, and 2030-11-14 respectively (5 years per major). How pgb turns those dates into gate errors and warnings — and how it announces future drops — is described in the [support matrix](reference/support-matrix).

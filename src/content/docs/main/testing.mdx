@@ -1,0 +1,125 @@
+---
+sidebar:
+  order: 15
+title: "Testing strategy"
+description: "Golden files, round-trip property tests through oliphant, and the docker CI matrix for PG18 + ParadeDB and PG19 beta."
+---
+
+Codegen correctness is the product. Four layers:
+
+## 1. Emitter unit tests
+
+Table-driven: expression tree in, SQL + args out, byte-exact. Coverage includes every operator in the [predicate reference](paradedb/predicates), every [version gate](reference/version-gates), and the error paths (`ErrNoWhere`, empty slices, cursor mismatch).
+
+## 2. Golden generated-code tests
+
+A canonical fixture lives in `testdata/golden/`: **`schema.sql`** (every type family, defaults, identity variants, generated columns, ranges/multiranges, enums/domains/composites, composite keys, FK actions, temporal `EXCLUDE`, partitions, multi-schema, views/matviews, keyword/case/unicode identifiers, `pgb:` directives, both `USING paradedb` shapes), **`queries.sql`** (every sqlc annotation incl. `:batchexec`/`:copyfrom`, joins, aggregates, windows, CTEs, a pg_search query with the `::float8` cast, a pgvector neighbor query), **`sqlc.yaml`** (pgx/v5, vector override in structured form), and **`COVERAGE.md`** — a 56-row matrix mapping each fixture feature to the generated artifact and pass that proves it. The fixture doubles as a parse/analyze acceptance test: `sqlc generate` (sqlc@main, pgx/v5) must succeed on it, and its first run surfaced three real findings (bare index-cast rejection, the hyphenated-pgvector override gotcha, `any` leaks for tsvector/xml/pg_lsn).
+
+```go
+// golden_test.go — harness shape;
+// the real one lives beside the generator
+var update = flag.Bool("update", false,
+	"rewrite golden files from current output")
+
+func TestGolden(t *testing.T) {
+	got, err := generateAll(t,
+		"testdata/golden/schema.sql", "testdata/golden/queries.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if *update {
+		if err := writeGolden(t, "testdata/snapshots", got); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	want, err := readGolden(t, "testdata/snapshots")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, wantSrc := range want {
+		if got[file] != wantSrc {
+			t.Errorf("%s drifted from the golden file — "+
+				"run with -update and review the diff", file)
+		}
+	}
+}
+```
+
+The `-update` flow, end to end:
+
+```bash
+# 1. change the generator (template, emitter, mapping)
+#    or the test schema
+# 2. regenerate the snapshot
+go test ./internal/gen -run TestGolden -update
+# 3. review what moved — every generated line is in the diff
+git diff --stat testdata/golden/
+git diff testdata/golden/db/models.gen.go
+# 4. CI runs without -update and fails on any unreviewed drift
+go test ./internal/gen -run TestGolden
+```
+
+Reviewing the diff *is* the code review for generator changes: because the emitter is deterministic (same tree → byte-identical SQL, see [core API](reference/core-api)), a golden diff shows exactly which generated lines a change moves and nothing else. No unreviewed drift can reach users — CI is red until the snapshot and the intent match.
+
+## 3. Round-trip property tests
+
+The emitter's SQL is fed back through oliphant and must re-parse to the same statement shape. The generator ships with the PG18 parser in-process, so it can check its own grammar on every fuzz case — malformed emission is caught generically, not per-bug.
+
+```text
+for each fuzz case (schema fragment + expression tree):
+    sql  := emitter.Emit(tree)          # byte-deterministic output
+    stmt := oliphant.Parse(sql)         # PG18 grammar,
+                                        # in-process — no server
+    assert parse succeeds
+    assert statement shape matches the tree
+        same tables, same clause order,
+        same parameter count as the tree's collected args
+```
+
+The parameter-count assertion is what guards `Raw` compositing and empty-slice casts: if emitted placeholders and collected args ever disagreed, pgx would send the wrong values at runtime — the property test catches the disagreement at fuzz time instead.
+
+## 4. Integration matrix (docker compose)
+
+Every generated function executed against real servers:
+
+| lane | image | covers |
+|---|---|---|
+| full | `paradedb/paradedb:0.25.9` on **PG18** | CRUD, builders, search, scoring, hybrid RRF |
+| plain | `postgres:19-beta` | CRUD, builders, upsert gates — search lanes skipped until ParadeDB ships PG19 builds |
+
+The ParadeDB lane is pinned to `0.25.9`, the tested floor: pg_search 0.25
+renamed the access method to `USING paradedb` (the only spelling pgb
+emits), and 0.25.9 is the current stable release.
+
+Both lanes run side by side in one compose file — separate ports, one `docker compose up`:
+
+```yaml
+services:
+  paradedb:                    # full lane — search + hybrid on PG18
+    # or an 0.26-rc tag; bundles pgvector (required since 0.25.0)
+    image: paradedb/paradedb:0.25.9
+    environment:
+      POSTGRES_USER: pgb
+      POSTGRES_PASSWORD: pgb
+      POSTGRES_DB: pgb
+    ports:
+      - "5432:5432"
+
+  pg19:                        # plain lane — non-search on PG19 beta
+    image: postgres:19-beta
+    environment:
+      POSTGRES_USER: pgb
+      POSTGRES_PASSWORD: pgb
+      POSTGRES_DB: pgb
+    ports:
+      - "5433:5432"
+```
+
+The test runner points the full lane at `localhost:5432` and the plain lane at `localhost:5433`, keyed off each lane's image. ParadeDB emits version-agnostic SQL on the non-search paths, so the PG19 lane needs no code changes when its search lane activates.
+
+## 5. Fork parity
+
+Pass A (models + query wrappers) is diffed against upstream sqlc-gen-go output on the same schema in CI, so the fork stays honest about what it changed — drift shows up as a diff, not a surprise.

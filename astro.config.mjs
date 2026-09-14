@@ -26,7 +26,10 @@ export default defineConfig({
         { icon: 'github', label: 'GitHub', href: 'https://github.com/khoale-2804/pgb' },
       ],
       sidebar: [
-        { label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
+        { label: 'Docs', items: [{ autogenerate: { directory: 'main' } }] },
+        { label: 'ParadeDB', items: [{ autogenerate: { directory: 'paradedb' } }] },
+        { label: 'Reference', items: [{ autogenerate: { directory: 'reference' } }] },
+        { label: 'Meta', items: [{ autogenerate: { directory: 'guides' } }] },
       ],
       customCss: ['./src/custom.css'],
       head: [

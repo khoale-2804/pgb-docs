@@ -1,0 +1,344 @@
+---
+sidebar:
+  order: 4
+title: "Quickstart"
+description: "Wire pgb into sqlc and generate your first builder + static functions — a complete end-to-end walkthrough."
+---
+
+pgb is a sqlc **process plugin**: a Go binary sqlc invokes with a protobuf `GenerateRequest` on stdin and reads `GenerateResponse` files back from stdout. You need [sqlc](https://docs.sqlc.dev), Go 1.24+, and pgx/v5 in your project. This walkthrough takes a two-table schema (one `USING paradedb` index) through config, generation, and a runnable program.
+
+## 1. Install sqlc (main until the next tagged release)
+
+The PostgreSQL 18 parser (`sqlc-dev/oliphant`) and unknown-function tolerance are merged on sqlc **main** but not yet in a tagged release (latest release: v1.31.1):
+
+```bash
+go install github.com/sqlc-dev/sqlc/cmd/sqlc@main
+```
+
+:::note
+On v1.31.1 your schema still parses fine (the PG17-era grammar handles all pgb-relevant DDL, including `USING paradedb`), but handwritten queries calling `pdb.*` functions fail type analysis — the graceful degradation to untyped `any` columns is sqlc main-branch behavior, not yet in a tagged release.
+:::
+
+## 2. Build the plugin binary
+
+```bash
+git clone https://github.com/khoale-2804/pgb && cd pgb
+go build -o /usr/local/bin/sqlc-gen-pgb ./gen
+```
+
+## 3. Write schema.sql
+
+Plain Postgres DDL — this is the single source of truth. Two tables; the index definition *is* the search schema (which columns get predicates, which tokenizer per field, the key field for scoring):
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_search;
+
+CREATE TABLE users (
+    id         bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email      text        NOT NULL UNIQUE,
+    name       text        NOT NULL,
+    bio        text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE products (
+    id          bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    seller_id   bigint      NOT NULL REFERENCES users (id),
+    title       text        NOT NULL,
+    description text        NOT NULL,
+    category    text        NOT NULL,
+    rating      integer     NOT NULL DEFAULT 0,
+    price_cents bigint      NOT NULL,
+    in_stock    boolean     NOT NULL DEFAULT true,
+    metadata    jsonb       NOT NULL DEFAULT '{}',
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- one ParadeDB index per table: columns listed here get search
+-- predicates, casts set tokenizers,
+-- WITH (key_field=) feeds pdb.score()
+CREATE INDEX products_search ON products USING paradedb
+  (id, description::pdb.icu,
+   (metadata->'color')::pdb.literal('alias=json_color'), rating)
+  WITH (key_field='id');
+```
+
+:::tip
+`description::pdb.icu` and the JSON-path alias `(metadata->'color')::pdb.literal('alias=json_color')` are exactly what ParadeDB 0.25.9+ accepts in the column list — pgb lifts them into the [SchemaIR](main/schema-ir) and generates predicates from them. See [index DDL extraction](paradedb/index-ddl).
+:::
+
+## 4. Configure sqlc.yaml
+
+One `codegen:` entry, one plugin, **one generated package**:
+
+```yaml
+version: '2'
+sql:
+  - engine: postgresql
+    schema: schema.sql
+    queries: queries.sql        # optional — handwritten queries only
+    codegen:
+      - out: db
+        plugin: pgb
+        options:
+          package: db           # the ONE generated package name
+          core: github.com/khoale-2804/pgb/core
+          target: "18"          # or "19": SQL emitter dialect gate
+          paradedb:
+            version: "0.26"     # pg_search gate: 0.25.9+ floor
+          emit:
+            batch: true         # InsertXxx batch funcs (unnest-based)
+            keyset: true        # cursor pagination helpers
+            hybrid: true        # SearchXxxHybrid with a vector column
+            merge: false        # MERGE builder (PG17+), off by default
+          vector_dim:
+            products: 768       # only needed for hybrid search
+          overrides:
+            - db_type: vector
+              go_type: github.com/pgvector/pgvector-go.Vector
+            - column: products.metadata
+              go_type: map[string]any
+plugins:
+  - name: pgb
+    process: { cmd: sqlc-gen-pgb }
+```
+
+:::note
+There is no `models_package` option. Models, query wrappers, descriptors, builders, and statics are all emitted into the single package named by `package:` — one type map, end to end.
+:::
+
+:::tip
+pgb **replaces** `gen: go:` — do not configure both. Models are emitted by pgb itself (forked sqlc-gen-go behavior), so the whole project shares one type map.
+:::
+
+## 5. Generate
+
+```bash
+sqlc generate
+```
+
+Output — one package, flat files:
+
+```text
+db/
+├── models.gen.go           # models, params, filters, sets, scans
+├── users.gen.go            # predicates, builder, CRUD statics
+├── products.gen.go         # predicates, builder, CRUD statics
+└── products_search.gen.go  # SearchProducts (+ Page/Hybrid)
+```
+
+What each file contains:
+
+| file | contents |
+|---|---|
+| `db/models.gen.go` | the `User` and `Product` structs; `InsertUserParams` / `InsertProductParams`; `UserFilter` / `UserSet` / `UpsertOpts` shapes; per-model explicit positional scan functions |
+| `db/users.gen.go` | the `db.Users` table descriptor with per-column predicate methods (`db.Users.Email().Like(...)`), the `UserSelect` builder, and the stage-2 statics — `GetUser`, `ListUsers`, `CountUsers`, `InsertUser`, `InsertUsers`, `UpdateUser`, `UpsertUser`, `DeleteUser`, `DeleteUsers` |
+| `db/products.gen.go` | the same surface for `products`, plus the JSON-path filter (`MetadataColorEq`) that comes from the indexed alias |
+| `db/products_search.gen.go` | `SearchProducts`, `SearchProductsPage`, `SearchProductsHybrid`, and the `ProductHit` result struct (row + score + snippets) — generated only because `products_search` exists |
+
+Handwritten queries from `queries.sql` (optional) become typed wrappers emitted into the same `db/` package — see [handwritten queries](main/handwritten-queries). Note there is no `users_search.gen.go`: the search layer is generated only for tables that actually carry a `USING paradedb` index.
+
+## 6. Call it — a runnable main.go
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	pgb "github.com/khoale-2804/pgb/core"
+	"github.com/your-org/shop/db"
+)
+
+func main() {
+	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("connect: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. InsertUser — typed params, RETURNING gives the row back
+	// INSERT INTO users (email, name) VALUES ($1, $2)
+	// RETURNING id, email, name, bio, created_at
+	ada, err := db.InsertUser(ctx, pool, db.InsertUserParams{
+		Email: "ada@example.com",
+		Name:  "Ada Lovelace",
+	})
+	if err != nil {
+		log.Fatalf("insert user: %v", err)
+	}
+
+	// 2. InsertProducts — batch insert via unnest, all rows returned
+	// INSERT INTO products (seller_id, title, description, category,
+	// rating, price_cents, in_stock, metadata)
+	// SELECT * FROM unnest($1::bigint[], $2::text[], ...)
+	// RETURNING id, seller_id, ...
+	inserts := []db.InsertProductParams{
+		{
+			SellerID:    ada.ID,
+			Title:       "Trail shoes",
+			Description: "Lightweight trail-running shoes",
+			Category:    "shoes",
+			Rating:      5,
+			PriceCents:  11990,
+			InStock:     true,
+			Metadata:    map[string]any{"color": "orange"},
+		},
+		{
+			SellerID:    ada.ID,
+			Title:       "Road shoes",
+			Description: "Responsive road-running shoes",
+			Category:    "shoes",
+			Rating:      4,
+			PriceCents:  9990,
+			InStock:     true,
+			Metadata:    map[string]any{"color": "red"},
+		},
+		{
+			SellerID:    ada.ID,
+			Title:       "Headlamp",
+			Description: "500-lumen rechargeable headlamp for night runs",
+			Category:    "gear",
+			Rating:      4,
+			PriceCents:  3450,
+			InStock:     false,
+			Metadata:    map[string]any{"color": "black"},
+		},
+	}
+	products, err := db.InsertProducts(ctx, pool, inserts)
+	if err != nil {
+		log.Fatalf("insert products: %v", err)
+	}
+
+	// 3. ListUsers — typed, optional filters;
+	// nil/zero fields are simply not emitted
+	// SELECT id, email, name, bio, created_at FROM users
+	// WHERE email LIKE $1 AND created_at >= $2 ORDER BY id LIMIT $3
+	users, err := db.ListUsers(ctx, pool, db.UserFilter{
+		EmailLike: pgb.Opt("%@example.com"),
+	}, pgb.Limit(20))
+	if err != nil {
+		log.Fatalf("list users: %v", err)
+	}
+	fmt.Printf("%d users, %d products seeded\n",
+		len(users), len(products))
+
+	// 4. SearchProducts — ParadeDB search generated from the
+	// USING paradedb index
+	// SELECT id, seller_id, ..., pdb.score(id) AS score,
+	//        pdb.snippet(description, start_tag => '<em>') AS snip
+	// FROM products
+	// WHERE description === $1::pdb.fuzzy(1)
+	//   AND category ||| $2::pdb.boost(2)
+	// ORDER BY pdb.score(id) DESC, id ASC
+	// LIMIT $3
+	hits, err := db.SearchProducts(ctx, pool, "runing shoes",
+		db.SearchOpts{
+			Fuzzy:         1, // === ::pdb.fuzzy(1) — tolerates the typo
+			BoostCategory: 2.0,
+			Snippet:       "description",
+		})
+	if err != nil {
+		log.Fatalf("search products: %v", err)
+	}
+	for _, h := range hits {
+		fmt.Printf("%.2f  %-12s %s\n",
+			h.Score, h.Row.Title, h.Snippet["description"])
+	}
+
+	// 5. UpdateUser — three-state sets:
+	// pgb.Set / pgb.Null / zero (= skip)
+	// UPDATE users SET bio = $2 WHERE id = $1
+	// RETURNING id, email, name, bio, created_at
+	if _, err := db.UpdateUser(ctx, pool, ada.ID, db.UserSet{
+		Bio: pgb.Set("author of the first published algorithm"),
+	}); err != nil {
+		log.Fatalf("update user: %v", err)
+	}
+
+	// 6. GetUser + sentinel error handling —
+	// pgb.ErrNotFound wraps pgx.ErrNoRows
+	if _, err := db.GetUser(ctx, pool, 424242); err != nil {
+		if errors.Is(err, pgb.ErrNotFound) {
+			fmt.Println("user 424242 not found (expected)")
+		} else {
+			log.Fatalf("get user: %v", err)
+		}
+	}
+
+	// 7. Transaction — pgx.BeginFunc; every generated function
+	// takes any pgb.DBTX, so the tx joins automatically.
+	// Builder + bulk update inside one commit.
+	err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := db.InsertProduct(ctx, tx, db.InsertProductParams{
+			SellerID: ada.ID, Title: "Chalk bag",
+			Description: "Magnesium chalk bag for bouldering",
+			Category:    "gear", Rating: 5, PriceCents: 2400, InStock: true,
+			Metadata: map[string]any{"color": "blue"},
+		}); err != nil {
+			return err
+		}
+		restocked, err := db.UpdateUsers(ctx, tx,
+			[]pgb.Expr{
+				db.Products.Category().Exact("gear"),
+				db.Products.InStock().Exact(false),
+			},
+			db.ProductSet{InStock: pgb.Set(true)},
+		)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("restocked %d gear items in-tx\n", restocked)
+		return nil
+	})
+	if err != nil {
+		log.Fatalf("tx: %v", err)
+	}
+}
+
+```
+
+:::note
+Every generated function names its executor parameter `exec` (`func GetUser(ctx context.Context, exec pgb.DBTX, id int64) (db.User, error)`), and `*pgxpool.Pool`, `*pgx.Conn`, and `pgx.Tx` all satisfy `pgb.DBTX` — so the same call site moves from pool to transaction without edits. See [runtime core API](reference/core-api).
+:::
+
+## 7. Run it
+
+Against the official ParadeDB image (pg_search preinstalled, pinned to
+`0.25.9` — the tested floor; the `USING paradedb` index pgb emits needs
+pg_search 0.25+):
+
+```bash
+docker run --name pgb-demo -e POSTGRES_PASSWORD=postgres \
+  -p 5432:5432 paradedb/paradedb:0.25.9
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
+psql "$DATABASE_URL" -f schema.sql
+sqlc generate
+go run ./cmd/demo
+```
+
+Expected output (search finds both "shoes" rows despite the typo — fuzzy):
+
+```text
+1 users, 3 products seeded
+9.87  Trail shoes   Lightweight <em>trail-running shoes</em>
+8.21  Road shoes    Responsive <em>road-running shoes</em>
+user 424242 not found (expected)
+restocked 1 gear items in-tx
+```
+
+## Where to next
+
+- [Generated builders](main/builders) — dynamic composition beyond the static shapes.
+- [Search predicates](paradedb/predicates) — the complete v2 operator vocabulary.
+- [Pagination](main/pagination) — keyset cursors, including score-ordered search pages.
+- [Configuration reference](reference/config) — every option in the `options:` block.

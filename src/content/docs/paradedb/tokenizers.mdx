@@ -1,0 +1,178 @@
+---
+sidebar:
+  order: 4
+title: "Tokenizers & token filters"
+description: "The 13 pg_search tokenizers, the token filter set, and how pgb carries tokenizer casts from the DDL into codegen."
+---
+
+Tokenizers decide how a field's text is split into indexed tokens; token filters transform those tokens afterwards. Both are declared per column inside the `USING paradedb` index definition — they affect indexing, never the predicate SQL pgb emits.
+
+## Tokenizers
+
+Thirteen tokenizers ship with pg_search. **Multiple tokenizers per field are allowed** — index the same column several ways (e.g. `icu` for matching plus `edge_ngrams` for autocomplete).
+
+| tokenizer | use case |
+|---|---|
+| `unicode` (default) | NFA-based Unicode segmentation; the multilingual default |
+| `simple` | splits on non-alphanumeric characters; plain prose |
+| `whitespace` | splits on whitespace only, keeps punctuation; tags, code fragments |
+| `literal` | no tokenization — the whole value is one token; keyword matching |
+| `literal_normalized` | like `literal`, with normalization applied |
+| `ngrams` | overlapping character n-grams; substring matching |
+| `edge_ngrams` | prefix-only n-grams; search-as-you-type |
+| `regex` | tokenizes by a user-supplied pattern |
+| `chinese_compatible` | CJK segmentation for space-less Chinese text |
+| `lindera` | dictionary-based morphological analysis; Japanese, Korean, Chinese |
+| `icu` | ICU-based segmentation; robust multilingual text and diacritics |
+| `jieba` | Chinese word segmentation |
+| `source_code` | splits camelCase/snake_case identifiers; code search |
+
+## What tokens come out
+
+Five tokenizers, one concrete input each. Lowercasing is on by default for these tokenizers; `literal` preserves the source text exactly and accepts no filters. You can reproduce any row with `SELECT '<input>'::<cast>::text[]`:
+
+| cast | input | tokens |
+|---|---|---|
+| `pdb.unicode_words` (the `unicode` default) | `Tokenize me!` | `{tokenize,me}` |
+| `pdb.literal` | `RUN-C42` | `{RUN-C42}` — one token, verbatim |
+| `pdb.ngram(3,3)` | `Tokenize me!` | `{tok,oke,ken,eni,niz,ize,"ze ","e m"," me",me!}` |
+| `pdb.edge_ngram(2,5)` | `Quick Fox` | `{qu,qui,quic,quick,fo,fox}` |
+| `pdb.icu` | `Hello world! 你好!` | `{hello,world,你好}` |
+
+Note how the n-gram tokenizers lowercase and keep every gram between `min` and `max` characters; `edge_ngram` anchors them to the start of each word, which is what makes it the search-as-you-type choice.
+
+## Token filters
+
+| filter | effect |
+|---|---|
+| `alphanumeric` | drops non-alphanumeric tokens |
+| `ascii_folding` | folds diacritics to ASCII (café → cafe) |
+| `lowercase` | lowercases tokens |
+| `lowercase_ngram` | lowercases, then n-grams |
+| `stopwords` | removes language stop words |
+| `stemming` | language stemmers |
+| `token_length` | drops tokens outside a length range |
+| `trim` | strips surrounding whitespace |
+
+Filters arrive as configuration strings in the tokenizer cast's argument list (any tokenizer except `literal` accepts them), e.g. `pdb.simple('stemmer=english', 'ascii_folding=true')`. Filters apply in the order they are listed — a diacritic-heavy value through a three-filter chain:
+
+```sql
+CREATE INDEX docs_search ON docs USING paradedb
+  (id, body::pdb.simple('ascii_folding=true', 'stemmer=english'))
+  WITH (key_field='id');
+```
+
+| stage | tokens for `Zoë's running SHOES` |
+|---|---|
+| tokenized by `pdb.simple` | `{zoë, s, running, shoes}` (lowercasing is on by default) |
+| after `ascii_folding=true` | `{zoe, s, running, shoes}` |
+| after `stemmer=english` | `{zoe, s, run, shoe}` |
+
+Because the index stores `run` and `shoe`, the query-side predicates match inflections ("running", "shoes") without any client-side normalization — pgb emits the operator and the stemmer does the folding.
+
+:::note
+A column indexed without a tokenizer cast uses the `unicode` default — only opt into others when segmentation or exactness demands it. ParadeDB allows one search index per table ([index DDL extraction](paradedb/index-ddl) enforces this at parse time), so tokenizer choices are fixed at index creation; indexing the same column under several tokenizers is the way to get both exact and fuzzier access to it.
+:::
+
+## Tokenizer choice vs predicate choice
+
+The tokenizer sets what tokens exist; the [predicate](paradedb/predicates) decides how the query matches them. Two pairings cover most tables:
+
+- **Exact fields** — `literal` (or `literal_normalized`) turns the whole value into a single token, which is what the `===` family (`.Exact`, `.ExactAny`) matches against: categories, SKUs, statuses.
+- **Prose fields** — `unicode`, `icu`, or `simple` produce many tokens per value, which is what `|||`, `###`, and fuzzy (`.Match`, `.Phrase`, `.Fuzzy`) expect.
+
+Mismatching the two is the classic silent-empty-result bug: an exact predicate against a prose-tokenized field only matches whole-token values. pgb does not re-tokenize client-side — it emits the operator and lets the index decide.
+
+## Cast spellings
+
+In the DDL, the tokenizer is a cast on the indexed column (same pass that records [fast flags](paradedb/index-ddl) and JSON-path aliases):
+
+```sql
+CREATE INDEX products_search ON products USING paradedb
+  (id,
+   description::pdb.icu,                 -- multilingual segmentation
+   title::pdb.simple('stemmer=english'), -- tokenizer with filter option
+   sku::pdb.literal,                     -- keyword-like, one token
+   suggest::pdb.ngram(3, 8)              -- substring window, min/max
+  )
+  WITH (key_field='id');
+```
+
+The cast is metadata, not a value conversion — it tells pg_search how to tokenize the field at index time. Windowed tokenizers take the range as arguments (`pdb.ngram(min, max)` above); `regex` takes its pattern as an argument.
+
+## One column, two tokenizers
+
+The same column can be indexed more than once inside the single per-table index. Give every extra variant an `alias=` argument; leave the primary field un-aliased so `ORDER BY`, `GROUP BY`, and aggregates can still reference it directly:
+
+```sql
+CREATE INDEX docs_search ON docs USING paradedb
+  (id,
+   title::pdb.simple('stemmer=english'),
+   title::pdb.edge_ngram(2, 12, 'alias=title_autocomplete'),
+   body::pdb.simple('stemmer=english', 'ascii_folding=true'))
+  WITH (key_field='id');
+```
+
+Under the hood this creates two index fields for `title`: the plain `title` field (stemmed words) and a distinct `title_autocomplete` field (prefix grams). Queries target the variant with the `::pdb.alias('name')` cast — which is exactly what the `pdb.alias` builder exists for:
+
+```sql
+-- prose matching: the plain title field
+SELECT id, title FROM docs WHERE title @@@ 'machine learning' LIMIT 10;
+
+-- search-as-you-type: the aliased variant
+SELECT id, title FROM docs
+WHERE title::pdb.alias('title_autocomplete') @@@ 'mach'
+LIMIT 10;
+```
+
+pgb exposes the aliased variant as its own descriptor on the generated table struct, snake case to Pascal case:
+
+```go
+// emits: WHERE title @@@ 'machine learning' LIMIT 10
+rows, err := db.SearchDocs(ctx, pool,
+	db.Docs.Title().Match("machine learning"), 10)
+
+// emits: WHERE title::pdb.alias('title_autocomplete') @@@ 'mach'
+//
+//	LIMIT 10
+rows, err := db.SearchDocs(ctx, pool,
+	db.Docs.TitleAutocomplete().Match("mach"), 10)
+```
+
+Both descriptors carry the full predicate surface; only the field they target differs. Tokenizer metadata for each variant is recorded on its own `SearchField` in the [SchemaIR](main/schema-ir).
+
+## How they flow through pgb
+
+pgb has no separate tokenizer config — tokenizers arrive as **casts in the DDL** and ride the [DDL extraction](paradedb/index-ddl) pass:
+
+```sql
+CREATE INDEX products_search ON products USING paradedb
+  (id, description::pdb.icu,
+   (metadata->'color')::pdb.literal('alias=json_color'), rating)
+  WITH (key_field='id');
+```
+
+The DDL pass records each cast as metadata on the IR `SearchField` — `Tokenizer: "icu"`, JSON path, alias, `PGType` — as shown in the worked example in [index DDL extraction](paradedb/index-ddl). Codegen then uses it:
+
+- **Index re-emission** — tokenizer metadata lets the index definition be reproduced exactly.
+- **Predicates** — which predicates a column gets is decided by its presence in the index ([predicates](paradedb/predicates)); the tokenizer choice stays in the DDL.
+- **Aliases** — `alias=` on a cast becomes the name predicates use: for JSON paths (`metadata->'color'` → `json_color`) and for multi-tokenizer variants (`title_autocomplete`), emitted with the `::pdb.alias('...')` cast.
+- **SchemaIR round-trip** — tokenizer/path/alias metadata lives in the [SchemaIR](main/schema-ir), so a changed cast shows up as a diff in regenerated code, reviewable like any other schema change.
+
+## Planned: DSL `@search` attributes
+
+:::warning
+Planned (P1) — not implemented in v0.1. Scope lives in the [vision](reference/vision).
+:::
+
+The proposed search DSL expresses this metadata as declarative `@search` attributes next to the field, instead of casts inside `CREATE INDEX`:
+
+```go
+type Product struct {
+	Description string `search:"tokenizer=icu"`
+	Color       string `search:"path=metadata->'color',
+    alias=json_color,tokenizer=literal"`
+}
+```
+
+The attributes cover `tokenizer:`, `path:`, and `alias:` — exactly the metadata the DDL pass extracts today. pgb would generate the `USING paradedb` index DDL from them, giving the search schema one source of truth: the Go struct, with the DDL as generated output rather than hand-maintained input.

@@ -51,7 +51,14 @@ extras (`template`, `hero`, `sidebar`, `prev`/`next`) — the landing
 | File | Role |
 | --- | --- |
 | `src/content/docs/index.mdx` | Landing page (splash hero) — hand-edit only |
-| `src/content/docs/guides/*.mdx` | Guides — auto-listed in the sidebar |
-| `src/content/docs/<dir>/*.mdx` | New section = new dir + a sidebar entry in `astro.config.mjs` |
+| `src/content/docs/main/*.mdx` | Docs tab — 17 pages, ported from the old Mintlify site |
+| `src/content/docs/paradedb/*.mdx` | ParadeDB tab — pg_search coverage |
+| `src/content/docs/reference/*.mdx` | Reference tab — config, internals, roadmap |
+| `src/content/docs/guides/*.mdx` | Meta pages (this guide) |
 | `astro.config.mjs` | Site title, sidebar sections, theme |
 | `src/custom.css` | Indigo palette + Space Grotesk |
+
+New pages in any collection appear in the CMS automatically (one directory
+per collection); new *sections* need a sidebar entry in `astro.config.mjs`.
+Starlight components (`Cards` → `CardGrid`, `Tabs`, `Aside`) need an
+import line at the top of the file — see any ported page for the pattern.

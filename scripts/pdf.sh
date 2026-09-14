@@ -18,10 +18,10 @@ WRAPPER="/tmp/chrome-nosandbox.$$"
 printf '#!/bin/sh\nexec %s --no-sandbox "$@"\n' "$CHROME" > "$WRAPPER"
 chmod +x "$WRAPPER"
 
-./node_modules/.bin/starlight-to-pdf http://localhost:4322 \
+./node_modules/.bin/starlight-to-pdf http://localhost:4322/main/introduction \
   --browser-executable "$WRAPPER" \
   --filename "${PDF_NAME:-docs}" \
-  --format A4 --print-bg --contents-name "Contents" \
+  --format A4 --print-bg --contents-name "Contents" --contents-links internal \
   -p dist
 
 rm -f "$WRAPPER"

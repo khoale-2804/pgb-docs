@@ -1,0 +1,227 @@
+---
+sidebar:
+  order: 6
+title: "SchemaIR"
+description: "The intermediate representation between parsing and codegen — tables, columns, paradedb indexes, directives."
+---
+
+Everything pgb generates is derived from one in-memory structure. Parsing (sqlc catalog, oliphant DDL pass) and codegen (three passes) only meet through it — which is what makes the standalone input mode possible.
+
+## The IR
+
+```go
+package ir
+
+type Schema struct {
+	DefaultSchema string // "public"
+	Tables        []Table
+	Enums         []Enum // named, per schema
+	Composites    []Composite
+	Domains       map[string]string // domain -> base type
+}
+
+type Table struct {
+	Schema, Name string
+	Comment      string
+	Columns      []Column
+	PrimaryKey   []string
+	Uniques      [][]string   // incl. WITHOUT OVERLAPS (temporal)
+	ForeignKeys  []ForeignKey // detected, kept inert in v1
+	Search       *SearchIndex // non-nil iff a paradedb index exists
+}
+
+type Column struct {
+	Name        string
+	PGType      string // resolved base type (domain unwrapped)
+	NotNull     bool
+	IsArray     bool
+	HasDefault  bool
+	DefaultExpr string
+	// "stored" | "virtual" (PG18 virtual = default kind)
+	Generated  string
+	IsTemporal bool // participates in WITHOUT OVERLAPS
+	Comment    string
+}
+
+type SearchIndex struct {
+	Name     string            // index name
+	Using    string            // "paradedb" | "bm25" (accepted alias)
+	KeyField string            // from WITH (key_field='id')
+	Fields   []SearchField     // ordered per DDL
+	Options  map[string]string // rest of WITH(...) raw
+}
+
+type SearchField struct {
+	Column string
+	Path   string // "metadata->'color'" for a JSON path
+	Alias  string // alias=json_color
+	// icu | simple(stemmer=english) | literal | ngram(3,3) | fast=...
+	Tokenizer string
+	// text | numeric | timestamp | boolean | jsonb | range | array
+	PGType string
+}
+
+```
+
+## Worked example: one table through the pipeline
+
+A three-column table plus one directive:
+
+```sql
+CREATE TABLE tags (
+    id    bigserial PRIMARY KEY,
+    name  text NOT NULL,
+    color text NOT NULL DEFAULT 'gray'
+);
+COMMENT ON COLUMN tags.color IS 'pgb:no_filter';
+```
+
+The IR pgb builds from it (catalog gives types and nullability; oliphant recovers the default expression; the `COMMENT ON` directive rides along):
+
+```go
+ir.Table{
+	Schema:     "public",
+	Name:       "tags",
+	PrimaryKey: []string{"id"},
+	Columns: []ir.Column{
+		{Name: "id", PGType: "int8", NotNull: true, HasDefault: true,
+			DefaultExpr: "nextval('tags_id_seq'::regclass)"},
+		{Name: "name", PGType: "text", NotNull: true},
+		{Name: "color", PGType: "text", NotNull: true, HasDefault: true,
+			DefaultExpr: "'gray'", Comment: "pgb:no_filter"},
+	},
+	// Search: nil — no USING paradedb index on this table
+}
+```
+
+What codegen emits from that IR:
+
+- **`db/models.gen.go`** — `type Tag struct { ID int64; Name string; Color string }`, plus `TagFilter` (only `id` and `name` — the `pgb:no_filter` directive hides `color` from predicates) and a `TagSet` covering all three columns for updates.
+- **`db/tags.gen.go`** — the `db.Tags` descriptor with `ID()` / `Name()` / `Color()` column methods, the `TagSelect` builder, and statics `GetTag` / `ListTags` / `CountTags` / `InsertTag` / `UpdateTag` / `DeleteTag`; `color` is omitted from the INSERT column list because `HasDefault` is set.
+- **No `tags_search.gen.go`** — `Search` is nil, so the search layer is skipped entirely for this table; no search predicates, no `SearchTags`, no `ProductHit`-style results.
+
+## Worked example: two tables end to end
+
+The single-table example above shows one column's facts; this one shows the whole IR — two tables, a foreign key, a directive, and one `USING paradedb` index — and exactly what each pass emits from it.
+
+The input `schema.sql`:
+
+```sql
+CREATE TABLE users (
+    id    bigserial PRIMARY KEY,
+    email text NOT NULL UNIQUE,
+    bio   text
+);
+
+CREATE TABLE products (
+    id          bigserial PRIMARY KEY,
+    user_id     bigint NOT NULL REFERENCES users(id),
+    title       text NOT NULL,
+    description text NOT NULL,
+    rating      integer NOT NULL DEFAULT 0
+);
+
+CREATE INDEX products_search ON products USING paradedb
+  (id, title, description::pdb.icu, rating)
+  WITH (key_field='id');
+
+COMMENT ON COLUMN users.bio IS 'pgb:no_patch';
+```
+
+The complete IR pgb builds from it — the sqlc catalog supplies tables, columns, types, nullability, and defaults; the oliphant re-parse supplies the index DDL and the `COMMENT ON` directive, neither of which survives into the proto:
+
+```go
+ir.Schema{
+	DefaultSchema: "public",
+	Tables: []ir.Table{
+		{
+			Schema:     "public",
+			Name:       "users",
+			PrimaryKey: []string{"id"},
+			Uniques:    [][]string{{"email"}},
+			Columns: []ir.Column{
+				{Name: "id", PGType: "int8",
+					NotNull: true, HasDefault: true,
+					DefaultExpr: "nextval('users_id_seq'::regclass)"},
+				{Name: "email", PGType: "text", NotNull: true},
+				{Name: "bio", PGType: "text", Comment: "pgb:no_patch"},
+			},
+			ForeignKeys: nil,
+			Search:      nil, // no USING paradedb index on users
+		},
+		{
+			Schema:     "public",
+			Name:       "products",
+			PrimaryKey: []string{"id"},
+			Columns: []ir.Column{
+				{Name: "id", PGType: "int8",
+					DefaultExpr: "nextval('products_id_seq'::regclass)",
+					NotNull:     true, HasDefault: true},
+				{Name: "user_id", PGType: "int8", NotNull: true},
+				{Name: "title", PGType: "text", NotNull: true},
+				{Name: "description", PGType: "text", NotNull: true},
+				{Name: "rating", PGType: "int4",
+					NotNull: true, HasDefault: true, DefaultExpr: "0"},
+			},
+			// detected from REFERENCES, kept inert in v1
+			ForeignKeys: []ir.ForeignKey{{
+				Columns:    []string{"user_id"},
+				RefTable:   "users",
+				RefColumns: []string{"id"},
+			}},
+			Search: &ir.SearchIndex{
+				Name:     "products_search",
+				Using:    "paradedb",
+				KeyField: "id",
+				Fields: []ir.SearchField{
+					{Column: "id"}, // key field
+					// no cast → default tokenizer (unicode)
+					{Column: "title", PGType: "text"},
+					{Column: "description", Tokenizer: "icu",
+						PGType: "text"},
+					// numeric family → fast field;
+					// int4range casts on search-side ranges
+					{Column: "rating", PGType: "numeric"},
+				},
+				Options: map[string]string{"key_field": "id"},
+			},
+		},
+	},
+}
+```
+
+What each pass emits from exactly this IR:
+
+- **Pass A — `db/models.gen.go`**: `type User struct { ID int64; Email string; Bio pgtype.Text }` and `type Product struct { ID int64; UserID int64; Title string; Description string; Rating int32 }`; `UserFilter`/`ProductFilter` (every column of each table — `pgb:no_patch` hides a column from updates, not from filters); `UserSet` **without** `Bio` versus `ProductSet` with all five columns; `InsertUserParams`/`InsertProductParams` — `rating` omitted from insert params (`HasDefault`), `bio` present as an optional write; the explicit-position `scanUser`/`scanProduct` funcs. No handwritten-query wrappers here — this schema has no `queries.sql`.
+- **Pass B — `db/users.gen.go` + `db/products.gen.go`**: the `db.Users` descriptor (`ID()`/`Email()`/`Bio()`) and `db.Products` descriptor (`ID()`/`UserID()`/`Title()`/`Description()`/`Rating()`), the `UserSelect`/`ProductSelect` builders, and predicates by type family — `Rating()` gets the ordered family (`Eq`/`Gt`/`Between`), `Title()`/`Description()` the text family (`Like`/`ILike`). The search family appears **only on indexed columns**: `Title().Match(...)`, `Description().Match(...)`, `Rating().RangeTerm(...)` on `db.Products`; nothing search-shaped on `db.Users`, because `Search` is nil.
+- **Pass C — `db/users.gen.go` + `db/products.gen.go` statics, plus `db/products_search.gen.go`**: `GetUser`/`ListUsers`/`CountUsers`/`InsertUser`/`InsertUsers`/`UpdateUser`/`UpdateUsers`/`DeleteUser`/`DeleteUsers` and the same nine for products; then the search layer for `products` only — `SearchProducts(ctx, pool, q, limit)` and its paged variant. No `SearchProductsHybrid`: hybrid search needs an indexed vector column, and this index has none. Search predicates compose only from the four indexed fields (`id`, `title`, `description`, `rating`) — `user_id` is a plain filter column, never a search predicate, because the index does not cover it.
+- **No `users_search.gen.go`** — `Search` is nil, so pass C skips the search layer for `users` entirely.
+
+The same three passes run unchanged whether this IR came from the sqlc plugin or the standalone `pgb-gen` mode — that is the point of routing all facts through it.
+
+## Where each fact comes from
+
+| fact | source | why |
+|---|---|---|
+| tables, columns, types, enums | sqlc catalog proto | already resolved (domains unwrapped, overrides applied) |
+| `USING paradedb` index DDL | oliphant re-parse | the proto catalog drops `CREATE INDEX` entirely |
+| generated columns (`STORED` / PG18 `VIRTUAL`) | oliphant re-parse | kind flag not in the proto |
+| temporal constraints (`WITHOUT OVERLAPS`) | oliphant re-parse | |
+| `COMMENT ON` directives | oliphant re-parse | inline `--` comments do not survive any PG parse — `COMMENT ON` is real DDL |
+
+Failure policy: if oliphant cannot parse a statement the sqlc catalog already resolved, that is a **warning**, not an error — the IR degrades to catalog-only and the search layer is simply not generated for the affected table.
+
+## Directives
+
+Ride in `COMMENT ON` statements so they are valid DDL:
+
+```sql
+COMMENT ON TABLE  users            IS 'pgb:skip';      -- no codegen
+COMMENT ON COLUMN users.password   IS 'pgb:no_filter'; -- no predicate
+COMMENT ON COLUMN users.bio        IS 'pgb:no_patch';  -- no Update set
+COMMENT ON COLUMN users.embedding  IS
+    'pgb:type=github.com/pgvector/pgvector-go.Vector';
+COMMENT ON COLUMN users.metadata   IS 'pgb:type=map[string]any';
+```
+
+v1 directive set: `pgb:skip`, `pgb:no_filter`, `pgb:no_patch`, `pgb:type=<go type>`. Everything global lives in the [sqlc.yaml options](reference/config) instead.

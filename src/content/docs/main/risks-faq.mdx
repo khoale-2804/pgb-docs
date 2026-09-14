@@ -1,0 +1,81 @@
+---
+sidebar:
+  order: 17
+title: "Risks & FAQ"
+description: "Known risks, sharp edges, and honest answers — from sqlc release lag to ParadeDB churn."
+---
+
+## Risks
+
+
+  <details>
+<summary>sqlc releases lag main</summary>
+
+    The PG18 parser (`oliphant`) and unknown-function tolerance are merged on sqlc main but not in a tagged release (v1.31.1 as of 2026-09-13). pgb pins `sqlc@main` until the next tagged release ships these. On v1.31.1 the schema still parses; only handwritten `pdb.*` queries lose type inference.
+  </details>
+  <details>
+<summary>ParadeDB API churn</summary>
+
+    The pg_search API broke twice in 2025 (`paradedb.*` → `pdb.*`, `USING bm25` → `USING paradedb`). All emission lives in one file (`core/search.go`) behind the `paradedb.version` gate. Predicate shapes marked "verify" are pinned by golden tests during M3.
+  </details>
+  <details>
+<summary>Fork drift from sqlc-gen-go</summary>
+
+    Pass A is a fork of upstream. A CI parity test diffs its output against upstream on the same schema — drift is a reviewable diff, not a silent behavior change.
+  </details>
+  <details>
+<summary>`any` leaking from unknown functions</summary>
+
+    Columns typed `any` (unresolved extension functions — the fallback is sqlc main-branch behavior, unreleased; v1.31.1 fails analysis instead) surface explicitly in generated code. Fix at the source: cast in SQL (`pdb.score(id)::float8`) or use database-backed analysis against a live ParadeDB.
+  </details>
+  <details>
+<summary>PG19 is beta</summary>
+
+    Emitter gates for PG19 syntax (`ON CONFLICT DO SELECT RETURNING`) are marked for re-verification at GA. No parser embeds PG19 grammar yet; keep PG19-only DDL out of schema.sql.
+  </details>
+
+
+## FAQ
+
+
+  <details>
+<summary>Why not just use go-jet/jet or bob?</summary>
+
+    They are the closest prior art and prove the design shape. jet generates builders from a **live database** via information_schema and escapes extension syntax through `Raw()`; bob is ORM-first (hooks, relationships, factories). Neither is ParadeDB-aware — no generated search predicates, score handling, or hybrid RRF — and neither runs off your sqlc schema files with a shared type map. pgb is sqlc-native and pg_search-native.
+  </details>
+  <details>
+<summary>Why a fork of sqlc-gen-go instead of a second plugin?</summary>
+
+    Two codegen paths mean two type maps; override sets drift silently and generated code disagrees with models. One fork = one map, and the fork-parity test keeps it reviewable.
+  </details>
+  <details>
+<summary>Why generate static functions at all — isn't the builder enough?</summary>
+
+    The builder is for dynamic composition. The static layer is for the 90% case: `GetUser`, `InsertUsers`, `SearchProducts` are one call, fully typed, zero ceremony. They compose the builder internally, so they stay composable when a query outgrows them.
+  </details>
+  <details>
+<summary>Does `sqlc vet` still work?</summary>
+
+    Yes — pgb runs inside sqlc as a plugin; vet, verify, and the whole config surface keep working. Only `gen: go:` is replaced.
+  </details>
+  <details>
+<summary>License implications of ParadeDB?</summary>
+
+    pg_search is AGPL-3.0 for the community edition. Using it in your stack (self-hosted) does not infect your application; redistribution of the extension itself is what AGPL governs.
+  </details>
+  <details>
+<summary>Why is the generated package named db?</summary>
+
+    sqlc muscle memory: years of sqlc tutorials and configs already use `out: db`, so the default matches what your fingers type. Models, query wrappers, descriptors, builders, and statics all live in that one package, set once via `package: db` — it is an ordinary config value, so `package: store` renames the package everywhere. (The early default `dbgen` is retired.)
+  </details>
+  <details>
+<summary>Can I rename it to paradedb or pdb?</summary>
+
+    Technically yes — `package:` accepts any valid Go identifier. Both are poor choices, though: `pdb` collides with debugger muscle memory (it reads as a debugger prompt in stack traces and shell history), and `paradedb` is the name the [plugin system](reference/plugins) scopes to the official `pgb-paradedb` extension — using it for the generated package would make plugin docs and generated symbols ambiguous. Pick a domain noun: `db`, `store`, `queries`.
+  </details>
+  <details>
+<summary>What does pgb cost me at build time?</summary>
+
+    One process spawn per `sqlc generate`: sqlc launches the `sqlc-gen-pgb` binary, pipes one protobuf request in, reads the files out, and exits. No daemon, no watch mode, and no codegen at `go build` time — the generated code is checked into the repo and compiles like anything you wrote. Generation cost is dominated by sqlc's own parse/analyze; pgb's three passes are in-memory and add milliseconds on realistic schemas.
+  </details>
+

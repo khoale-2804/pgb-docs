@@ -24,15 +24,31 @@ export default config({
     // section label → collection keys (NOT { label } objects — the UI does
     // keys.map() on these values and crashes on anything but an array)
     navigation: {
-      Docs: ['docs'],
-      Guides: ['guides'],
+      Docs: ['main'],
+      ParadeDB: ['paradedb'],
+      Reference: ['reference'],
+      Meta: ['guides'],
     },
   },
   collections: {
-    docs: collection({
+    main: collection({
       label: 'Docs',
       slugField: 'title',
-      path: 'src/content/docs/*',
+      path: 'src/content/docs/main/*',
+      format: { contentField: 'body' },
+      schema: docSchema,
+    }),
+    paradedb: collection({
+      label: 'ParadeDB',
+      slugField: 'title',
+      path: 'src/content/docs/paradedb/*',
+      format: { contentField: 'body' },
+      schema: docSchema,
+    }),
+    reference: collection({
+      label: 'Reference',
+      slugField: 'title',
+      path: 'src/content/docs/reference/*',
       format: { contentField: 'body' },
       schema: docSchema,
     }),
